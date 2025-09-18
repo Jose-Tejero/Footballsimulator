@@ -1,9 +1,8 @@
-import React, { useMemo, useState } from "react";
+import React, { useState } from "react";
 import {
-  DriveOutcome,
-  DriveResult,
   GameConfig,
   SimulationResult,
+  TeamSimulationDetail,
   TeamStats,
   simulateGame,
 } from "./simulation";
@@ -12,51 +11,129 @@ import styles from "./NFLSimulator.module.css";
 type TeamInputs = Record<keyof TeamStats, string>;
 
 interface ConfigInputs {
-  drivesPerTeam: string;
   allowTies: boolean;
-  overtimeEnabled: boolean;
-  maxRounds: string;
-  seed: string;
+  maxOtRounds: string;
+  otScale: string;
+  tiebreakPolicy: "expected" | "home";
 }
 
-interface UsedConfig {
-  drivesPerTeam: number;
-  allowTies: boolean;
-  overtimeEnabled: boolean;
-  maxRounds?: number;
-}
+const DEFAULT_HOME_INPUTS: TeamInputs = {
+  pointsPerGame: "24.6",
+  pointsAllowedPerGame: "20.9",
+  yardsPerPlay: "5.9",
+  turnoverRate: "1.1",
+};
 
-const formatDriveLabel = (drive: DriveOutcome, index: number): string => {
-  const prefix = `Drive ${index + 1}`;
-  if (drive.result === DriveResult.NONE) {
-    return `${prefix}: sin puntos`;
+const DEFAULT_AWAY_INPUTS: TeamInputs = {
+  pointsPerGame: "22.3",
+  pointsAllowedPerGame: "21.7",
+  yardsPerPlay: "5.7",
+  turnoverRate: "1.3",
+};
+
+const DEFAULT_CONFIG_INPUTS: ConfigInputs = {
+  allowTies: false,
+  maxOtRounds: "3",
+  otScale: "0.25",
+  tiebreakPolicy: "expected",
+};
+
+const formatSigned = (value: number): string => {
+  const rounded = value.toFixed(1);
+  return value >= 0 ? `+${rounded}` : rounded;
+};
+
+const parsePositiveNumber = (value: string, label: string): number => {
+  const parsed = Number.parseFloat(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    throw new Error(`${label} debe ser un numero mayor que 0.`);
+  }
+  return parsed;
+};
+
+const parseNonNegativeNumber = (value: string, label: string): number => {
+  const parsed = Number.parseFloat(value);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    throw new Error(`${label} debe ser un numero mayor o igual a 0.`);
+  }
+  return parsed;
+};
+
+const parseTeamStats = (inputs: TeamInputs, label: string): TeamStats => {
+  return {
+    pointsPerGame: parseNonNegativeNumber(inputs.pointsPerGame, `${label}: puntos por juego`),
+    pointsAllowedPerGame: parseNonNegativeNumber(
+      inputs.pointsAllowedPerGame,
+      `${label}: puntos permitidos por juego`,
+    ),
+    yardsPerPlay: parsePositiveNumber(inputs.yardsPerPlay, `${label}: yardas por jugada`),
+    turnoverRate: parseNonNegativeNumber(inputs.turnoverRate, `${label}: entregas por juego`),
+  };
+};
+
+const parseConfig = (inputs: ConfigInputs): GameConfig => {
+  const allowTies = inputs.allowTies;
+
+  const maxOtRounds = Number.parseInt(inputs.maxOtRounds, 10);
+  if (!Number.isFinite(maxOtRounds) || maxOtRounds < 0) {
+    throw new Error("Las rondas maximas de OT deben ser un entero mayor o igual a 0.");
   }
 
-  const label = drive.result === DriveResult.TD ? "TD" : "FG";
-  return `${prefix}: ${label} (${drive.points} pts)`;
+  const otScale = Number.parseFloat(inputs.otScale);
+  if (!Number.isFinite(otScale) || otScale < 0 || otScale > 1) {
+    throw new Error("La escala de OT debe estar entre 0 y 1.");
+  }
+
+  return {
+    allowTies,
+    maxOtRounds,
+    otScale,
+    tiebreakPolicy: inputs.tiebreakPolicy,
+  };
+};
+
+const sumPoints = (points: number[]): number => points.reduce((total, value) => total + value, 0);
+
+const renderTeamSummary = (title: string, detail: TeamSimulationDetail) => {
+  const overtimeTotal = sumPoints(detail.overtimePoints);
+  const finalWithOt = detail.finalPoints + overtimeTotal;
+
+  return (
+    <div className={styles.summaryCard}>
+      <h3>{title}</h3>
+      <p>
+        <strong>Esperado:</strong> {detail.expectedPoints.toFixed(1)} pts
+      </p>
+      <p>
+        <strong>Variacion (YPP):</strong> {formatSigned(detail.variation)} pts
+      </p>
+      <p>
+        <strong>Penalizacion por entregas:</strong> -{detail.turnoverPenalty.toFixed(1)} pts
+      </p>
+      <p>
+        <strong>Proyeccion ajustada:</strong> {detail.rawProjection.toFixed(1)} pts
+      </p>
+      <p>
+        <strong>Marcador regulacion:</strong> {detail.finalPoints} pts
+      </p>
+      {detail.overtimePoints.length > 0 && (
+        <p>
+          <strong>OT:</strong> {overtimeTotal} pts ({detail.overtimePoints.join(", ")})
+        </p>
+      )}
+      <p>
+        <strong>Marcador final:</strong> {finalWithOt} pts
+      </p>
+    </div>
+  );
 };
 
 const NFLSimulator: React.FC = () => {
-  const [homeInputs, setHomeInputs] = useState<TeamInputs>({
-    offPtsDrive: "2.5",
-    defPtsDrive: "2.2",
-  });
-  const [awayInputs, setAwayInputs] = useState<TeamInputs>({
-    offPtsDrive: "2.3",
-    defPtsDrive: "2.4",
-  });
-  const [configInputs, setConfigInputs] = useState<ConfigInputs>({
-    drivesPerTeam: "12",
-    allowTies: true,
-    overtimeEnabled: true,
-    maxRounds: "3",
-    seed: "",
-  });
-
+  const [homeInputs, setHomeInputs] = useState<TeamInputs>(DEFAULT_HOME_INPUTS);
+  const [awayInputs, setAwayInputs] = useState<TeamInputs>(DEFAULT_AWAY_INPUTS);
+  const [configInputs, setConfigInputs] = useState<ConfigInputs>(DEFAULT_CONFIG_INPUTS);
   const [result, setResult] = useState<SimulationResult | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [usedConfig, setUsedConfig] = useState<UsedConfig | null>(null);
-  const [usedSeed, setUsedSeed] = useState<number | undefined>(undefined);
 
   const handleTeamInputChange = (
     team: "home" | "away",
@@ -71,123 +148,25 @@ const NFLSimulator: React.FC = () => {
     }
   };
 
-  const handleConfigNumericChange = (
-    field: "drivesPerTeam" | "maxRounds" | "seed",
-    value: string,
-  ) => {
+  const handleConfigChange = <Key extends keyof ConfigInputs>(field: Key, value: ConfigInputs[Key]) => {
     setError(null);
     setConfigInputs((prev) => ({ ...prev, [field]: value }));
-  };
-
-  const parseTeamStats = (inputs: TeamInputs, label: string): TeamStats => {
-    const off = Number.parseFloat(inputs.offPtsDrive);
-    const def = Number.parseFloat(inputs.defPtsDrive);
-
-    if (Number.isNaN(off)) {
-      throw new Error(`Ingresa un numero valido para el promedio ofensivo (${label}).`);
-    }
-    if (Number.isNaN(def)) {
-      throw new Error(`Ingresa un numero valido para el promedio defensivo (${label}).`);
-    }
-
-    return {
-      offPtsDrive: off,
-      defPtsDrive: def,
-    };
-  };
-
-  const buildGameConfig = (): GameConfig & UsedConfig => {
-    const drives = Number.parseInt(configInputs.drivesPerTeam, 10);
-    if (Number.isNaN(drives) || drives <= 0) {
-      throw new Error("Drives por equipo debe ser un entero positivo.");
-    }
-
-    const allowTies = configInputs.allowTies;
-
-    let maxRounds: number | undefined;
-    if (configInputs.maxRounds.trim().length > 0) {
-      const parsedMax = Number.parseInt(configInputs.maxRounds, 10);
-      if (Number.isNaN(parsedMax) || parsedMax <= 0) {
-        throw new Error("Rondas de OT debe ser un entero positivo.");
-      }
-      maxRounds = parsedMax;
-    }
-
-    let seedValue: number | undefined;
-    if (configInputs.seed.trim().length > 0) {
-      const parsedSeed = Number.parseInt(configInputs.seed, 10);
-      if (Number.isNaN(parsedSeed)) {
-        throw new Error("La semilla debe ser un numero entero.");
-      }
-      seedValue = parsedSeed;
-    }
-
-    const overtimeEnabled = !allowTies && configInputs.overtimeEnabled;
-
-    const gameConfig: GameConfig = {
-      drivesPerTeam: drives,
-      allowTies,
-      seed: seedValue,
-    };
-
-    if (!allowTies) {
-      gameConfig.overtime = {
-        enabled: overtimeEnabled,
-        maxRounds,
-      };
-    }
-
-    return {
-      ...gameConfig,
-      drivesPerTeam: drives,
-      allowTies,
-      overtimeEnabled,
-      maxRounds,
-    };
   };
 
   const handleSimulate = () => {
     try {
       const homeStats = parseTeamStats(homeInputs, "Equipo local");
       const awayStats = parseTeamStats(awayInputs, "Equipo visitante");
-      const config = buildGameConfig();
+      const config = parseConfig(configInputs);
 
       const simulation = simulateGame(homeStats, awayStats, config);
-
       setResult(simulation);
-      setUsedConfig({
-        drivesPerTeam: config.drivesPerTeam,
-        allowTies: config.allowTies ?? true,
-        overtimeEnabled: config.overtimeEnabled,
-        maxRounds: config.maxRounds,
-      });
-      setUsedSeed(config.seed);
       setError(null);
     } catch (err) {
       setResult(null);
-      setUsedConfig(null);
       setError(err instanceof Error ? err.message : "Ocurrio un error inesperado");
     }
   };
-
-  const overtimeInfo = useMemo(() => {
-    if (!result || !usedConfig) {
-      return { rounds: 0, wasApplied: false, capped: false };
-    }
-
-    const extraDrives = result.homeDrives.length - usedConfig.drivesPerTeam;
-    const rounds = extraDrives > 0 ? extraDrives : 0;
-
-    const wasApplied = rounds > 0;
-    const capped =
-      wasApplied &&
-      usedConfig.overtimeEnabled &&
-      typeof usedConfig.maxRounds === "number" &&
-      rounds >= usedConfig.maxRounds &&
-      result.homeScore === result.awayScore;
-
-    return { rounds, wasApplied, capped };
-  }, [result, usedConfig]);
 
   const renderResults = result ? (
     <div className={styles.resultsSection}>
@@ -202,66 +181,54 @@ const NFLSimulator: React.FC = () => {
         </div>
       </div>
 
-      {usedSeed !== undefined && (
-        <div className={styles.info}>Semilla utilizada: {usedSeed}</div>
-      )}
-
-      <div className={styles.drivesContainer}>
-        <div className={styles.driveList}>
-          <h3>Drives local</h3>
-          <ul>
-            {result.homeDrives.map((drive, index) => (
-              <li key={`home-drive-${index}`} className={styles.driveItem}>
-                {formatDriveLabel(drive, index)}
-              </li>
-            ))}
-          </ul>
-        </div>
-        <div className={styles.driveList}>
-          <h3>Drives visitante</h3>
-          <ul>
-            {result.awayDrives.map((drive, index) => (
-              <li key={`away-drive-${index}`} className={styles.driveItem}>
-                {formatDriveLabel(drive, index)}
-              </li>
-            ))}
-          </ul>
-        </div>
+      <div className={styles.summaryGrid}>
+        {renderTeamSummary("Equipo local", result.homeDetail)}
+        {renderTeamSummary("Equipo visitante", result.awayDetail)}
       </div>
 
-      <div className={styles.summaryCard}>
-        <h3>Resumen de anotaciones</h3>
-        <p>
-          <strong>Local:</strong> {result.summary.homeTDs} TD / {result.summary.homeFGs} FG
-        </p>
-        <p>
-          <strong>Visitante:</strong> {result.summary.awayTDs} TD / {result.summary.awayFGs} FG
-        </p>
-        <p className={styles.info}>
-          {overtimeInfo.wasApplied && usedConfig ? (
-            <>
-              Se jugaron {overtimeInfo.rounds} rondas de tiempo extra.
-              {overtimeInfo.capped && usedConfig.maxRounds && (
-                <> Empate tras agotar {usedConfig.maxRounds} rondas.</>
-              )}
-            </>
-          ) : (
-            <>No fue necesario tiempo extra.</>
+      {result.overtime && (
+        <div className={styles.overtimeSummary}>
+          <h3>Tiempo extra</h3>
+          <p>
+            Rondas jugadas: <strong>{result.overtime.rounds}</strong>
+          </p>
+          <p>
+            Puntos OT local: <strong>{sumPoints(result.overtime.homePoints)}</strong>
+            {result.overtime.homePoints.length > 0 && ` (${result.overtime.homePoints.join(", ")})`}
+          </p>
+          <p>
+            Puntos OT visitante: <strong>{sumPoints(result.overtime.awayPoints)}</strong>
+            {result.overtime.awayPoints.length > 0 && ` (${result.overtime.awayPoints.join(", ")})`}
+          </p>
+          {result.overtime.tiebreakApplied && (
+            <div className={styles.tiebreakTag}>
+              Desempate por politica: {result.overtime.tiebreakApplied}
+            </div>
           )}
-        </p>
+        </div>
+      )}
+
+      <div className={styles.info}>
+        El modelo usa promedios de puntos, eficiencia ofensiva y entregas para generar una
+        proyeccion rapida del marcador. Ajusta las entradas para explorar distintos
+        escenarios.
       </div>
     </div>
   ) : (
     <div className={styles.placeholder}>
       <h3>Simula un partido</h3>
-      <p>Ajusta los promedios ofensivos y defensivos de cada equipo para estimar su eficiencia por drive.</p>
-      <p>Presiona "Simular partido" para ver el marcador, el detalle de cada serie y el resumen de anotaciones.</p>
+      <p>
+        Ingresa puntos por juego, puntos permitidos, yardas por jugada y entregas por juego
+        para cada equipo.
+      </p>
+      <p>Configura el tiempo extra para garantizar un ganador.</p>
+      <p>Presiona "Simular partido" para obtener una proyeccion de marcador.</p>
     </div>
   );
 
   return (
     <div className={styles.container}>
-      <h1 className={styles.heading}>Simulador NFL por Drive</h1>
+      <h1 className={styles.heading}>Simulador NFL por Juego</h1>
 
       <div className={styles.desktopLayout}>
         <div className={styles.leftPanel}>
@@ -269,143 +236,174 @@ const NFLSimulator: React.FC = () => {
             <div className={styles.card}>
               <h2 className={styles.cardTitle}>Equipo local</h2>
               <div className={styles.field}>
-                <label htmlFor="home-off">Promedio ofensivo (pts/drive)</label>
+                <label htmlFor="home-ppg">Puntos por juego (PPG)</label>
                 <input
-                  id="home-off"
+                  id="home-ppg"
                   type="number"
+                  min="0"
                   step="0.1"
                   inputMode="decimal"
-                  placeholder="Ej: 2.5"
-                  value={homeInputs.offPtsDrive}
+                  value={homeInputs.pointsPerGame}
                   onChange={(event) =>
-                    handleTeamInputChange("home", "offPtsDrive", event.target.value)
+                    handleTeamInputChange("home", "pointsPerGame", event.target.value)
                   }
                 />
-                <span className={styles.helpText}>Promedio ofensivo por drive.</span>
               </div>
               <div className={styles.field}>
-                <label htmlFor="home-def">Promedio defensivo (pts/drive)</label>
+                <label htmlFor="home-papg">Puntos permitidos por juego (PAPG)</label>
                 <input
-                  id="home-def"
+                  id="home-papg"
                   type="number"
+                  min="0"
                   step="0.1"
                   inputMode="decimal"
-                  placeholder="Ej: 2.2"
-                  value={homeInputs.defPtsDrive}
+                  value={homeInputs.pointsAllowedPerGame}
                   onChange={(event) =>
-                    handleTeamInputChange("home", "defPtsDrive", event.target.value)
+                    handleTeamInputChange("home", "pointsAllowedPerGame", event.target.value)
                   }
                 />
-                <span className={styles.helpText}>Puntos permitidos por drive.</span>
+              </div>
+              <div className={styles.field}>
+                <label htmlFor="home-ypp">Yardas por jugada (YPP)</label>
+                <input
+                  id="home-ypp"
+                  type="number"
+                  min="0"
+                  step="0.1"
+                  inputMode="decimal"
+                  value={homeInputs.yardsPerPlay}
+                  onChange={(event) =>
+                    handleTeamInputChange("home", "yardsPerPlay", event.target.value)
+                  }
+                />
+              </div>
+              <div className={styles.field}>
+                <label htmlFor="home-turnovers">Entregas por juego</label>
+                <input
+                  id="home-turnovers"
+                  type="number"
+                  min="0"
+                  step="0.1"
+                  inputMode="decimal"
+                  value={homeInputs.turnoverRate}
+                  onChange={(event) =>
+                    handleTeamInputChange("home", "turnoverRate", event.target.value)
+                  }
+                />
               </div>
             </div>
 
             <div className={styles.card}>
               <h2 className={styles.cardTitle}>Equipo visitante</h2>
               <div className={styles.field}>
-                <label htmlFor="away-off">Promedio ofensivo (pts/drive)</label>
+                <label htmlFor="away-ppg">Puntos por juego (PPG)</label>
                 <input
-                  id="away-off"
+                  id="away-ppg"
                   type="number"
+                  min="0"
                   step="0.1"
                   inputMode="decimal"
-                  placeholder="Ej: 2.3"
-                  value={awayInputs.offPtsDrive}
+                  value={awayInputs.pointsPerGame}
                   onChange={(event) =>
-                    handleTeamInputChange("away", "offPtsDrive", event.target.value)
+                    handleTeamInputChange("away", "pointsPerGame", event.target.value)
                   }
                 />
-                <span className={styles.helpText}>Promedio ofensivo por drive.</span>
               </div>
               <div className={styles.field}>
-                <label htmlFor="away-def">Promedio defensivo (pts/drive)</label>
+                <label htmlFor="away-papg">Puntos permitidos por juego (PAPG)</label>
                 <input
-                  id="away-def"
+                  id="away-papg"
                   type="number"
+                  min="0"
                   step="0.1"
                   inputMode="decimal"
-                  placeholder="Ej: 2.4"
-                  value={awayInputs.defPtsDrive}
+                  value={awayInputs.pointsAllowedPerGame}
                   onChange={(event) =>
-                    handleTeamInputChange("away", "defPtsDrive", event.target.value)
+                    handleTeamInputChange("away", "pointsAllowedPerGame", event.target.value)
                   }
                 />
-                <span className={styles.helpText}>Puntos permitidos por drive.</span>
+              </div>
+              <div className={styles.field}>
+                <label htmlFor="away-ypp">Yardas por jugada (YPP)</label>
+                <input
+                  id="away-ypp"
+                  type="number"
+                  min="0"
+                  step="0.1"
+                  inputMode="decimal"
+                  value={awayInputs.yardsPerPlay}
+                  onChange={(event) =>
+                    handleTeamInputChange("away", "yardsPerPlay", event.target.value)
+                  }
+                />
+              </div>
+              <div className={styles.field}>
+                <label htmlFor="away-turnovers">Entregas por juego</label>
+                <input
+                  id="away-turnovers"
+                  type="number"
+                  min="0"
+                  step="0.1"
+                  inputMode="decimal"
+                  value={awayInputs.turnoverRate}
+                  onChange={(event) =>
+                    handleTeamInputChange("away", "turnoverRate", event.target.value)
+                  }
+                />
               </div>
             </div>
 
             <div className={`${styles.card} ${styles.fullWidthCard}`}>
-              <h2 className={styles.cardTitle}>Configuracion del partido</h2>
-              <div className={styles.field}>
-                <label htmlFor="drives">Drives por equipo</label>
-                <input
-                  id="drives"
-                  type="number"
-                  min="1"
-                  step="1"
-                  inputMode="numeric"
-                  placeholder="Ej: 12"
-                  value={configInputs.drivesPerTeam}
-                  onChange={(event) =>
-                    handleConfigNumericChange("drivesPerTeam", event.target.value)
-                  }
-                />
-                <span className={styles.helpText}>
-                  Un drive es una posesion ofensiva completa: empieza cuando un equipo gana el balon (kickoff, despeje o entrega) y termina cuando anota, entrega el balon, patea un gol de campo o expira el reloj.
-                  Este valor fija cuantas series ofensivas tiene cada franquicia en el tiempo reglamentario y, por lo tanto, el marco total de oportunidades para generar puntos antes de pasar la posesion al rival.
-                  En la NFL real los equipos suelen tener entre 10 y 14 drives por partido segun ritmo y eficiencia, asi que modificar este numero permite simular juegos mas rapidos, defensivos o, por el contrario, duelos con muchas posesiones.
-                </span>
-              </div>
+              <h2 className={styles.cardTitle}>Configuracion de OT</h2>
               <div className={styles.checkboxRow}>
                 <input
-                  id="ties"
+                  id="allow-ties"
                   type="checkbox"
                   checked={configInputs.allowTies}
-                  onChange={(event) => {
-                    setError(null);
-                    const allowTies = event.target.checked;
-                    setConfigInputs((prev) => ({
-                      ...prev,
-                      allowTies,
-                      overtimeEnabled: allowTies ? false : prev.overtimeEnabled || true,
-                    }));
-                  }}
+                  onChange={(event) => handleConfigChange("allowTies", event.target.checked)}
                 />
-                <label htmlFor="ties">Permitir empates</label>
+                <label htmlFor="allow-ties">Permitir empates</label>
               </div>
               <div className={styles.field}>
                 <label htmlFor="ot-rounds">Rondas maximas de OT</label>
                 <input
                   id="ot-rounds"
                   type="number"
-                  min="1"
+                  min="0"
                   step="1"
                   inputMode="numeric"
-                  placeholder="Ej: 3"
-                  value={configInputs.maxRounds}
-                  onChange={(event) =>
-                    handleConfigNumericChange("maxRounds", event.target.value)
-                  }
-                  disabled={configInputs.allowTies || !configInputs.overtimeEnabled}
+                  value={configInputs.maxOtRounds}
+                  onChange={(event) => handleConfigChange("maxOtRounds", event.target.value)}
+                  disabled={configInputs.allowTies}
                 />
-                <span className={styles.helpText}>
-                  Se agrega un drive por equipo en cada ronda de tiempo extra.
-                </span>
               </div>
               <div className={styles.field}>
-                <label htmlFor="seed">Semilla (opcional)</label>
+                <label htmlFor="ot-scale">Escala de OT (0-1)</label>
                 <input
-                  id="seed"
+                  id="ot-scale"
                   type="number"
-                  step="1"
-                  inputMode="numeric"
-                  placeholder="Ej: 2024"
-                  value={configInputs.seed}
-                  onChange={(event) =>
-                    handleConfigNumericChange("seed", event.target.value)
-                  }
+                  min="0"
+                  max="1"
+                  step="0.05"
+                  inputMode="decimal"
+                  value={configInputs.otScale}
+                  onChange={(event) => handleConfigChange("otScale", event.target.value)}
+                  disabled={configInputs.allowTies}
                 />
-                <span className={styles.helpText}>Usa una semilla para reproducir el resultado.</span>
+              </div>
+              <div className={styles.field}>
+                <label htmlFor="tiebreak">Politica de desempate</label>
+                <select
+                  id="tiebreak"
+                  value={configInputs.tiebreakPolicy}
+                  onChange={(event) =>
+                    handleConfigChange("tiebreakPolicy", event.target.value as ConfigInputs["tiebreakPolicy"])
+                  }
+                  disabled={configInputs.allowTies}
+                >
+                  <option value="expected">expected</option>
+                  <option value="home">home</option>
+                </select>
               </div>
             </div>
           </div>
@@ -423,6 +421,4 @@ const NFLSimulator: React.FC = () => {
   );
 };
 
-
 export default NFLSimulator;
-

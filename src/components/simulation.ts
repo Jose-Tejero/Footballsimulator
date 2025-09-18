@@ -1,53 +1,50 @@
-ï»¿export interface TeamStats {
-  offPtsDrive: number;
-  defPtsDrive: number;
+export interface TeamStats {
+  pointsPerGame: number;
+  pointsAllowedPerGame: number;
+  yardsPerPlay: number;
+  turnoverRate: number;
 }
 
-export enum DriveResult {
-  TD = "TD",
-  FG = "FG",
-  NONE = "NONE",
+export interface TeamSimulationDetail {
+  expectedPoints: number;
+  variation: number;
+  turnoverPenalty: number;
+  rawProjection: number;
+  finalPoints: number;
+  overtimePoints: number[];
 }
 
-export interface DriveOutcome {
-  result: DriveResult;
-  points: number;
-}
-
-export interface SimulationSummary {
-  homeTDs: number;
-  homeFGs: number;
-  awayTDs: number;
-  awayFGs: number;
+export interface OvertimeResult {
+  rounds: number;
+  homePoints: number[];
+  awayPoints: number[];
+  tiebreakApplied: "expected" | "home" | null;
 }
 
 export interface SimulationResult {
   homeScore: number;
   awayScore: number;
-  homeDrives: DriveOutcome[];
-  awayDrives: DriveOutcome[];
-  summary: SimulationSummary;
-}
-
-export interface OvertimeConfig {
-  enabled: boolean;
-  maxRounds?: number;
+  homeDetail: TeamSimulationDetail;
+  awayDetail: TeamSimulationDetail;
+  overtime?: OvertimeResult;
 }
 
 export interface GameConfig {
-  drivesPerTeam?: number;
-  allowTies?: boolean;
-  overtime?: OvertimeConfig;
   seed?: number;
+  allowTies?: boolean;
+  maxOtRounds?: number;
+  otScale?: number;
+  tiebreakPolicy?: "expected" | "home";
 }
 
 type RandomFn = () => number;
 
-const MIN_POINTS_PER_DRIVE = 0.2;
-const MAX_POINTS_PER_DRIVE = 4.0;
-const MAX_SCORING_PROBABILITY = 0.85;
-const BASE_SCORING_MULTIPLIER = 0.4;
-const DEFAULT_DRIVES_PER_TEAM = 12;
+const TURNOVER_PENALTY_FACTOR = 2;
+const TURNOVER_PENALTY_FACTOR_OT = 0.8;
+const DEFAULT_ALLOW_TIES = false;
+const DEFAULT_MAX_OT_ROUNDS = 3;
+const DEFAULT_OT_SCALE = 0.25;
+const DEFAULT_TIEBREAK_POLICY: "expected" | "home" = "expected";
 
 const clamp = (value: number, min: number, max: number): number => {
   return Math.min(Math.max(value, min), max);
@@ -69,110 +66,168 @@ const createRandomGenerator = (seed?: number): RandomFn => {
   };
 };
 
-const validatePointsPerDrive = (label: string, value: number): void => {
-  if (!(value > 0)) {
-    throw new Error(`${label} must be greater than 0`);
+const randomGaussian = (rng: RandomFn, mean = 0, stdDev = 1): number => {
+  let u = 0;
+  let v = 0;
+
+  while (u === 0) {
+    u = rng();
+  }
+
+  while (v === 0) {
+    v = rng();
+  }
+
+  const magnitude = Math.sqrt(-2.0 * Math.log(u));
+  const angle = 2.0 * Math.PI * v;
+  const standard = magnitude * Math.cos(angle);
+  return mean + standard * Math.max(stdDev, 0);
+};
+
+const ensureNonNegative = (label: string, value: number): void => {
+  if (!Number.isFinite(value) || value < 0) {
+    throw new Error(`${label} debe ser un numero mayor o igual a 0.`);
   }
 };
 
-/**
- * Simula un drive individual en base a la eficiencia ofensiva propia y la defensa rival.
- */
-export const simulateDrive = (
-  offensePtsDrive: number,
-  defensePtsDrive: number,
-  rng: RandomFn = Math.random,
-): DriveOutcome => {
-  validatePointsPerDrive("offensePtsDrive", offensePtsDrive);
-  validatePointsPerDrive("defensePtsDrive", defensePtsDrive);
-
-  const offense = clamp(offensePtsDrive, MIN_POINTS_PER_DRIVE, MAX_POINTS_PER_DRIVE);
-  const defense = clamp(defensePtsDrive, MIN_POINTS_PER_DRIVE, MAX_POINTS_PER_DRIVE);
-
-  const offensiveFactor = offense / defense;
-  const scoringProbability = clamp(
-    BASE_SCORING_MULTIPLIER * offensiveFactor,
-    0,
-    MAX_SCORING_PROBABILITY,
-  );
-
-  if (rng() < scoringProbability) {
-    return rng() < 0.75
-      ? { result: DriveResult.TD, points: 7 }
-      : { result: DriveResult.FG, points: 3 };
+const ensurePositive = (label: string, value: number): void => {
+  if (!Number.isFinite(value) || value <= 0) {
+    throw new Error(`${label} debe ser un numero mayor que 0.`);
   }
+};
 
-  return { result: DriveResult.NONE, points: 0 };
+const calculateTeamDetail = (
+  team: TeamStats,
+  opponent: TeamStats,
+  rng: RandomFn,
+): TeamSimulationDetail => {
+  ensureNonNegative("pointsPerGame", team.pointsPerGame);
+  ensureNonNegative("pointsAllowedPerGame", team.pointsAllowedPerGame);
+  ensurePositive("yardsPerPlay", team.yardsPerPlay);
+  ensureNonNegative("turnoverRate", team.turnoverRate);
+  ensureNonNegative("pointsAllowedPerGame", opponent.pointsAllowedPerGame);
+
+  const expected = (team.pointsPerGame + opponent.pointsAllowedPerGame) / 2;
+  const variation = randomGaussian(rng, 0, Math.max(0.1, team.yardsPerPlay * 0.5));
+  const turnoverPenalty = team.turnoverRate * TURNOVER_PENALTY_FACTOR;
+  const rawProjection = expected + variation - turnoverPenalty;
+  const finalPoints = Math.max(0, Math.round(rawProjection));
+
+  return {
+    expectedPoints: expected,
+    variation,
+    turnoverPenalty,
+    rawProjection,
+    finalPoints,
+    overtimePoints: [],
+  };
 };
 
 /**
- * Simula un partido completo, alternando drives entre local y visitante.
+ * Calcula los puntos anotados por un equipo en una ronda de tiempo extra.
+ * Usa una fracción del esperado en tiempo regular, con menor varianza y penalización reducida.
  */
+const simulateOtPoints = (
+  expectedReg: number,
+  ypp: number,
+  turnoverRate: number,
+  scale: number,
+  rng: RandomFn,
+): number => {
+  ensureNonNegative("expectedReg", expectedReg);
+  ensurePositive("ypp", ypp);
+  ensureNonNegative("turnoverRate", turnoverRate);
+
+  const safeScale = clamp(Number.isFinite(scale) ? scale : DEFAULT_OT_SCALE, 0, 1);
+  const expectedOT = clamp(expectedReg * safeScale, 0, 12);
+  const variation = randomGaussian(rng, 0, Math.max(0.1, ypp * 0.25));
+  const penalty = turnoverRate * TURNOVER_PENALTY_FACTOR_OT;
+  const projection = expectedOT + variation - penalty;
+
+  return Math.max(0, Math.round(projection));
+};
+
 export const simulateGame = (
   home: TeamStats,
   away: TeamStats,
   config: GameConfig = {},
 ): SimulationResult => {
   const rng = createRandomGenerator(config.seed);
-  const drivesPerTeam = config.drivesPerTeam ?? DEFAULT_DRIVES_PER_TEAM;
-  const allowTies = config.allowTies ?? true;
-  const overtimeConfig = config.overtime;
 
-  if (!(drivesPerTeam > 0)) {
-    throw new Error("drivesPerTeam must be greater than 0");
-  }
+  const allowTies = config.allowTies ?? DEFAULT_ALLOW_TIES;
+  const maxOtRounds = Number.isFinite(config.maxOtRounds)
+    ? Math.max(0, Math.floor(config.maxOtRounds as number))
+    : DEFAULT_MAX_OT_ROUNDS;
+  const otScale = config.otScale ?? DEFAULT_OT_SCALE;
+  const tiebreakPolicy = config.tiebreakPolicy ?? DEFAULT_TIEBREAK_POLICY;
 
-  const homeDrives: DriveOutcome[] = [];
-  const awayDrives: DriveOutcome[] = [];
+  const homeDetail = calculateTeamDetail(home, away, rng);
+  const awayDetail = calculateTeamDetail(away, home, rng);
 
-  let homeScore = 0;
-  let awayScore = 0;
+  let homeScore = homeDetail.finalPoints;
+  let awayScore = awayDetail.finalPoints;
 
-  const summary: SimulationSummary = {
-    homeTDs: 0,
-    homeFGs: 0,
-    awayTDs: 0,
-    awayFGs: 0,
-  };
-
-  const recordOutcome = (team: "home" | "away", outcome: DriveOutcome) => {
-    if (team === "home") {
-      homeDrives.push(outcome);
-      homeScore += outcome.points;
-      if (outcome.result === DriveResult.TD) summary.homeTDs += 1;
-      if (outcome.result === DriveResult.FG) summary.homeFGs += 1;
-    } else {
-      awayDrives.push(outcome);
-      awayScore += outcome.points;
-      if (outcome.result === DriveResult.TD) summary.awayTDs += 1;
-      if (outcome.result === DriveResult.FG) summary.awayFGs += 1;
-    }
-  };
-
-  for (let i = 0; i < drivesPerTeam; i += 1) {
-    recordOutcome("home", simulateDrive(home.offPtsDrive, away.defPtsDrive, rng));
-    recordOutcome("away", simulateDrive(away.offPtsDrive, home.defPtsDrive, rng));
-  }
-
-  const overtimeEnabled = !allowTies && (overtimeConfig?.enabled ?? true);
-  const maxOvertimeRounds = overtimeConfig?.maxRounds ?? (overtimeEnabled ? 6 : 0);
+  const overtimePointsHome: number[] = [];
+  const overtimePointsAway: number[] = [];
   let roundsPlayed = 0;
+  let tiebreakApplied: "expected" | "home" | null = null;
 
-  while (overtimeEnabled && homeScore === awayScore) {
-    if (Number.isFinite(maxOvertimeRounds) && roundsPlayed >= maxOvertimeRounds) {
-      break;
+  if (!allowTies && homeScore === awayScore) {
+    // Ejecuta rondas de tiempo extra hasta encontrar un ganador o agotar el limite configurado.
+    while (homeScore === awayScore && roundsPlayed < maxOtRounds) {
+      const homeOt = simulateOtPoints(
+        homeDetail.expectedPoints,
+        home.yardsPerPlay,
+        home.turnoverRate,
+        otScale,
+        rng,
+      );
+      const awayOt = simulateOtPoints(
+        awayDetail.expectedPoints,
+        away.yardsPerPlay,
+        away.turnoverRate,
+        otScale,
+        rng,
+      );
+
+      overtimePointsHome.push(homeOt);
+      overtimePointsAway.push(awayOt);
+      homeScore += homeOt;
+      awayScore += awayOt;
+      roundsPlayed += 1;
     }
 
-    roundsPlayed += 1;
-    recordOutcome("home", simulateDrive(home.offPtsDrive, away.defPtsDrive, rng));
-    recordOutcome("away", simulateDrive(away.offPtsDrive, home.defPtsDrive, rng));
+    if (homeScore === awayScore) {
+      tiebreakApplied = tiebreakPolicy;
+      if (tiebreakPolicy === "expected") {
+        if (homeDetail.expectedPoints > awayDetail.expectedPoints) {
+          homeScore += 1;
+        } else if (awayDetail.expectedPoints > homeDetail.expectedPoints) {
+          awayScore += 1;
+        } else {
+          homeScore += 1;
+        }
+      } else {
+        homeScore += 1;
+      }
+    }
   }
+
+  const overtime: OvertimeResult | undefined =
+    roundsPlayed > 0 || tiebreakApplied !== null
+      ? {
+          rounds: roundsPlayed,
+          homePoints: overtimePointsHome,
+          awayPoints: overtimePointsAway,
+          tiebreakApplied,
+        }
+      : undefined;
 
   return {
     homeScore,
     awayScore,
-    homeDrives,
-    awayDrives,
-    summary,
+    homeDetail: { ...homeDetail, overtimePoints: overtimePointsHome.slice() },
+    awayDetail: { ...awayDetail, overtimePoints: overtimePointsAway.slice() },
+    overtime,
   };
 };
